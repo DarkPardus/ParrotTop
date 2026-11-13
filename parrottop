@@ -1,0 +1,896 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+parrottop - adbtop tarzı canlı sistem monitörü (Parrot Security OS / Debian tabanlı Linux)
+
+Bağımlılık yok: yalnızca Python 3 standart kütüphanesi. Veriler /proc ve /sys'den okunur.
+Çalıştırma:  python3 parrottop      (veya chmod +x parrottop && ./parrottop)
+Önerilen terminal boyutu: en az 100x28, 256 renk (TERM=xterm-256color).
+"""
+import collections
+import csv
+import curses
+import glob
+import locale
+import math
+import os
+import platform
+import socket
+import time
+from types import SimpleNamespace as NS
+
+CLK = os.sysconf("SC_CLK_TCK")
+NCPU = os.cpu_count() or 1
+WINDOWS = [30, 60, 120, 300]        # saniye
+INTERVALS = [1.0, 2.0, 0.5]         # örnekleme aralığı (sn)
+HISTMAX = 700
+BLK = " ▁▂▃▄▅▆▇█"
+SORTS = ["cpu", "mem", "thr"]
+FSTYPES = {"ext4", "ext3", "ext2", "btrfs", "xfs", "vfat", "exfat", "ntfs", "ntfs3", "f2fs", "fuseblk", "zfs"}
+
+THEMES = {
+    "adbtop": dict(txt=252, dim=244, title=214, a=142, b=208, c=175, d=109, red=203, green=114, yel=221, line=240, hbg=237),
+    "parrot": dict(txt=252, dim=244, title=51, a=48, b=39, c=207, d=45, red=203, green=84, yel=226, line=238, hbg=236),
+}
+FALLBACK = dict(txt=7, dim=7, title=3, a=2, b=3, c=5, d=6, red=1, green=2, yel=3, line=7, hbg=0)
+NAMES = ["txt", "dim", "title", "a", "b", "c", "d", "red", "green", "yel", "line"]
+
+
+# ----------------------------------------------------------------- yardımcılar
+def rd(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def rdi(path, default=None):
+    try:
+        return int(rd(path))
+    except Exception:
+        return default
+
+
+def hb(n):
+    n = float(n)
+    for u in "BKMGT":
+        if n < 1024 or u == "T":
+            return f"{n:.0f}{u}" if (n >= 100 or u == "B") else f"{n:.1f}{u}"
+        n /= 1024
+
+
+def hbs(n):
+    return ("+" if n >= 0 else "-") + hb(abs(n))
+
+
+def fw(sec):
+    sec = int(sec)
+    m, s = divmod(sec, 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+def nice(v, floor):
+    v = max(v, floor)
+    e = 10 ** int(math.floor(math.log10(v)))
+    for m in (1, 2, 2.5, 5, 10):
+        if v <= m * e:
+            return m * e
+    return v
+
+
+def hexip(h):
+    try:
+        b = bytes.fromhex(h)
+        if len(b) == 4:
+            return socket.inet_ntop(socket.AF_INET, b[::-1])
+        b = b"".join(b[i:i + 4][::-1] for i in range(0, 16, 4))
+        ip = socket.inet_ntop(socket.AF_INET6, b)
+        return ip[7:] if ip.startswith("::ffff:") else ip
+    except Exception:
+        return h
+
+
+def cols(data, n, window):
+    """Geçmişi n sütuna indirger (kovada max)."""
+    d = list(data)[-window:]
+    d = [None] * (window - len(d)) + d
+    out = []
+    for c in range(n):
+        lo = c * window // n
+        hi = max(lo + 1, (c + 1) * window // n)
+        v = [x for x in d[lo:hi] if x is not None]
+        out.append(max(v) if v else None)
+    return out
+
+
+# ----------------------------------------------------------------- veri toplama
+class Sampler:
+    def __init__(s):
+        s.t = time.time()
+        s.tick = 0
+        s.h = collections.defaultdict(lambda: collections.deque(maxlen=HISTMAX))
+        s.prev_cpu = None
+        s.prev_proc = {}
+        s.prev_disk = None
+        s.prev_net = None
+        s.net0 = None
+        s.proc_hist = {}
+        s.marks = []
+        s.sort = "cpu"
+        s.cores = [0.0] * NCPU
+        s.cpu = (0.0, 0.0, 0.0, 0.0)
+        s.freq = [None] * NCPU
+        s.fmax = [None] * NCPU
+        s.mem = {}
+        s.procs = []
+        s.nproc = s.nthr = s.nrun = 0
+        s.disk = dict(r=0, w=0, util=0, iops=0, devs=[])
+        s.fs = []
+        s.net = dict(rx=0, tx=0, rxt=0, txt=0, ifs=[])
+        s.est = collections.Counter()
+        s.listen = set()
+        s.bat = None
+        s.ac = None
+        s.temps = []
+        s.sample()
+
+    def sample(s):
+        now = time.time()
+        dt = max(now - s.t, 0.05) if s.tick else 1.0
+        s.t = now
+        s._cpu()
+        s._mem()
+        s._procs(dt)
+        s._disk(dt)
+        s._net(dt)
+        if s.tick % 5 == 0:
+            s._fs()
+        s._power()
+        s.tick += 1
+
+    def push(s, k, v):
+        s.h[k].append(v)
+
+    # --- CPU
+    def _cpu(s):
+        cur = {}
+        for line in rd("/proc/stat").splitlines():
+            if line.startswith("cpu"):
+                p = line.split()
+                cur[p[0]] = [int(x) for x in p[1:]]
+        cores = [0.0] * NCPU
+        tot = (0.0, 0.0, 0.0, 0.0)
+        if s.prev_cpu:
+            res = {}
+            for k, v in cur.items():
+                o = s.prev_cpu.get(k)
+                if not o:
+                    continue
+                d = [a - b for a, b in zip(v, o)]
+                t = sum(d[:8]) or 1
+                busy = t - d[3] - d[4]
+                res[k] = (100.0 * busy / t, 100.0 * (d[0] + d[1]) / t,
+                          100.0 * (d[2] + d[5] + d[6]) / t, 100.0 * d[4] / t)
+            tot = res.get("cpu", tot)
+            cores = [res.get(f"cpu{i}", (0,))[0] for i in range(NCPU)]
+        s.prev_cpu = cur
+        s.cpu, s.cores = tot, cores
+        s.push("cpu", tot[0]); s.push("cpu_user", tot[1]); s.push("cpu_sys", tot[2])
+        for i, c in enumerate(cores):
+            s.push(f"core{i}", c)
+        for i in range(NCPU):
+            b = f"/sys/devices/system/cpu/cpu{i}/cpufreq/"
+            f, m = rdi(b + "scaling_cur_freq"), rdi(b + "cpuinfo_max_freq")
+            s.freq[i] = f / 1e6 if f else None
+            s.fmax[i] = m / 1e6 if m else None
+
+    # --- Bellek
+    def _mem(s):
+        m = {}
+        for line in rd("/proc/meminfo").splitlines():
+            try:
+                k, v = line.split(":")
+                m[k] = int(v.split()[0]) * 1024
+            except Exception:
+                pass
+        tot = m.get("MemTotal", 1)
+        avail = m.get("MemAvailable", m.get("MemFree", 0))
+        layers = dict(
+            app=m.get("AnonPages", 0),
+            cache=max(0, m.get("Cached", 0) + m.get("SReclaimable", 0) - m.get("Shmem", 0)),
+            buf=m.get("Buffers", 0),
+            shm=m.get("Shmem", 0),
+            krn=max(0, m.get("Slab", 0) - m.get("SReclaimable", 0) + m.get("KernelStack", 0) + m.get("PageTables", 0)),
+        )
+        s.mem = dict(total=tot, avail=avail, used=tot - avail, layers=layers,
+                     st=m.get("SwapTotal", 0), su=m.get("SwapTotal", 0) - m.get("SwapFree", 0))
+        s.push("mem_used", tot - avail)
+        for k, v in layers.items():
+            s.push("m_" + k, v)
+
+    # --- Süreçler
+    def _procs(s, dt):
+        cur, rows, nthr, nrun = {}, [], 0, 0
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    st = f.read()
+            except Exception:
+                continue
+            i = st.rfind(")")
+            name = st[st.find("(") + 1:i]
+            f = st[i + 2:].split()
+            try:
+                ticks = int(f[11]) + int(f[12])
+                thr = int(f[17])
+                rss = int(f[21]) * 4096
+                core = int(f[36])
+            except Exception:
+                continue
+            cur[pid] = ticks
+            nthr += thr
+            if f[0] == "R":
+                nrun += 1
+            o = s.prev_proc.get(pid)
+            pct = max(0.0, (ticks - o) / CLK / dt * 100.0) if o is not None else 0.0
+            hh = s.proc_hist.get(pid)
+            if hh is None:
+                hh = s.proc_hist[pid] = collections.deque(maxlen=300)
+            hh.append(pct)
+            rows.append(dict(pid=pid, name=name, state=f[0], cpu=pct, core=core, rss=rss, thr=thr))
+        for pid in list(s.proc_hist):
+            if pid not in cur:
+                del s.proc_hist[pid]
+        s.prev_proc = cur
+        s.nproc, s.nthr, s.nrun = len(rows), nthr, nrun
+        key = {"cpu": lambda r: (r["cpu"], r["rss"]), "mem": lambda r: r["rss"], "thr": lambda r: r["thr"]}[s.sort]
+        rows.sort(key=key, reverse=True)
+        s.procs = rows[:40]
+
+    # --- Disk
+    def _disk(s, dt):
+        cur = {}
+        for line in rd("/proc/diskstats").splitlines():
+            p = line.split()
+            if len(p) < 13:
+                continue
+            n = p[2]
+            if n.startswith(("loop", "ram", "zram", "dm-", "sr")) or not os.path.exists(f"/sys/block/{n}"):
+                continue
+            cur[n] = (int(p[5]), int(p[9]), int(p[12]), int(p[3]) + int(p[7]))
+        r = w = io = ops = 0.0
+        util = 0.0
+        devs = []
+        if s.prev_disk:
+            for n, v in cur.items():
+                o = s.prev_disk.get(n)
+                if not o:
+                    continue
+                rr, ww = (v[0] - o[0]) * 512 / dt, (v[1] - o[1]) * 512 / dt
+                u = min(100.0, (v[2] - o[2]) / (dt * 10.0))
+                op = (v[3] - o[3]) / dt
+                r += rr; w += ww; ops += op
+                util = max(util, u)
+                devs.append((n, rr, ww, u))
+        s.prev_disk = cur
+        s.disk = dict(r=r, w=w, util=util, iops=ops, devs=devs)
+        s.push("dr", r); s.push("dw", w); s.push("dutil", util)
+
+    def _fs(s):
+        seen, out = set(), []
+        for line in rd("/proc/mounts").splitlines():
+            p = line.split()
+            if len(p) < 3 or p[2] not in FSTYPES or p[0] in seen:
+                continue
+            seen.add(p[0])
+            try:
+                v = os.statvfs(p[1])
+            except OSError:
+                continue
+            tot = v.f_blocks * v.f_frsize
+            if tot:
+                out.append((p[1], tot - v.f_bfree * v.f_frsize, tot))
+        s.fs = out[:6]
+
+    # --- Ağ
+    def _net(s, dt):
+        cur = {}
+        for line in rd("/proc/net/dev").splitlines()[2:]:
+            try:
+                n, v = line.split(":")
+                p = v.split()
+                cur[n.strip()] = (int(p[0]), int(p[8]))
+            except Exception:
+                pass
+        if s.net0 is None:
+            s.net0 = {k: v for k, v in cur.items()}
+        rx = tx = 0.0
+        ifs = []
+        if s.prev_net:
+            for n, v in cur.items():
+                o = s.prev_net.get(n)
+                if not o or n == "lo":
+                    continue
+                a, b = (v[0] - o[0]) / dt, (v[1] - o[1]) / dt
+                rx += a; tx += b
+                ifs.append((n, rd(f"/sys/class/net/{n}/operstate", "?"), a, b))
+        s.prev_net = cur
+        rxt = sum(v[0] - s.net0.get(k, v)[0] for k, v in cur.items() if k != "lo")
+        txt = sum(v[1] - s.net0.get(k, v)[1] for k, v in cur.items() if k != "lo")
+        ifs.sort(key=lambda i: i[2] + i[3], reverse=True)
+        s.net = dict(rx=rx, tx=tx, rxt=rxt, txt=txt, ifs=ifs)
+        s.push("rx", rx); s.push("tx", tx)
+        est, listen = collections.Counter(), set()
+        for fn in ("/proc/net/tcp", "/proc/net/tcp6"):
+            for line in rd(fn).splitlines()[1:]:
+                p = line.split()
+                if len(p) < 4:
+                    continue
+                if p[3] == "0A":
+                    try:
+                        listen.add(int(p[1].rsplit(":", 1)[1], 16))
+                    except Exception:
+                        pass
+                elif p[3] == "01":
+                    ip = hexip(p[2].rsplit(":", 1)[0])
+                    if not (ip.startswith("127.") or ip == "::1"):
+                        est[ip] += 1
+        s.est, s.listen = est, listen
+
+    # --- Güç / sıcaklık
+    def _power(s):
+        bat = ac = None
+        for d in glob.glob("/sys/class/power_supply/*"):
+            t = rd(d + "/type")
+            if t == "Battery" and bat is None:
+                v, c, p = rdi(d + "/voltage_now"), rdi(d + "/current_now"), rdi(d + "/power_now")
+                watts = p / 1e6 if p else (v * c / 1e12 if v and c else None)
+                bat = dict(cap=rdi(d + "/capacity"), status=rd(d + "/status"),
+                           volt=v / 1e6 if v else None, watts=watts)
+            elif t == "Mains":
+                ac = rdi(d + "/online")
+        temps, seen = [], set()
+        for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+            t = rdi(z + "/temp")
+            if t is not None:
+                temps.append((rd(z + "/type", "zone")[:9], t / 1000.0))
+        for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            nm = rd(hw + "/name", "hw")
+            for f in sorted(glob.glob(hw + "/temp*_input")):
+                t = rdi(f)
+                if t is None:
+                    continue
+                lab = rd(f.replace("_input", "_label"), os.path.basename(f).split("_")[0])
+                temps.append((f"{nm}:{lab}"[:9], t / 1000.0))
+        uniq = []
+        for l, t in temps:
+            if (l, round(t)) not in seen and 0 < t < 150:
+                seen.add((l, round(t)))
+                uniq.append((l, t))
+        s.bat, s.ac, s.temps = bat, ac, uniq[:12]
+        tmax = max([t for _, t in uniq], default=0)
+        s.push("tmax", tmax)
+        s.push("watts", (bat or {}).get("watts") or 0)
+
+
+# ----------------------------------------------------------------- arayüz
+class App:
+    def __init__(s, scr):
+        s.scr = scr
+        s.S = Sampler()
+        s.page, s.wi, s.ii, s.theme = 1, 1, 0, "adbtop"
+        s.paused = False
+        s.help = False
+        s.flash = ("", 0)
+        s.t0 = time.time()
+        s.host = platform.node()
+        s.kernel = platform.release()
+        s.distro = "Linux"
+        for line in rd("/etc/os-release").splitlines():
+            if line.startswith("PRETTY_NAME="):
+                s.distro = line.split("=", 1)[1].strip('"')
+        curses.curs_set(0)
+        curses.use_default_colors()
+        s.init_colors()
+        scr.timeout(100)
+        scr.keypad(True)
+
+    # properties
+    @property
+    def interval(s):
+        return INTERVALS[s.ii]
+
+    @property
+    def nwin(s):
+        return max(10, int(WINDOWS[s.wi] / s.interval))
+
+    def init_colors(s):
+        th = THEMES[s.theme]
+        big = curses.COLORS >= 256
+        for i, n in enumerate(NAMES):
+            curses.init_pair(i + 1, th[n] if big else FALLBACK[n], -1)
+        curses.init_pair(20, 16 if big else 0, th["title"] if big else FALLBACK["title"])
+        curses.init_pair(21, th["txt"] if big else 7, th["hbg"] if big else 0)
+
+    def c(s, name):
+        if name == "tab":
+            return curses.color_pair(20)
+        if name == "hdr":
+            return curses.color_pair(21)
+        return curses.color_pair(NAMES.index(name) + 1)
+
+    # ---- çizim primitifleri
+    def put(s, y, x, text, attr=0):
+        H, W = s.scr.getmaxyx()
+        if y < 0 or y >= H or x >= W or not text:
+            return
+        if x < 0:
+            text = text[-x:]
+            x = 0
+        text = text[:W - x]
+        if y == H - 1 and x + len(text) >= W:
+            text = text[:W - x - 1]
+        try:
+            s.scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+    def segs(s, y, x, items, maxw):
+        for t, col in items:
+            if maxw <= 0:
+                break
+            t = t[:maxw]
+            s.put(y, x, t, s.c(col))
+            x += len(t)
+            maxw -= len(t)
+
+    def bar(s, frac, wd, col):
+        k = int(round(max(0.0, min(1.0, frac)) * wd))
+        return [("█" * k, col), ("░" * (wd - k), "dim")]
+
+    def box(s, y, x, h, w, title, right=""):
+        a = s.c("line")
+        s.put(y, x, "╭" + "─" * (w - 2) + "╮", a)
+        for r in range(1, h - 1):
+            s.put(y + r, x, "│", a)
+            s.put(y + r, x + w - 1, "│", a)
+        s.put(y + h - 1, x, "╰" + "─" * (w - 2) + "╯", a)
+        s.put(y, x + 2, " " + title + " ", s.c("title") | curses.A_BOLD)
+        if right:
+            s.put(y, x + w - len(right) - 4, " " + right + " ", s.c("dim"))
+
+    def frame(s, y, x, h, w, title, right, reserve=0, axis=6):
+        s.box(y, x, h, w, title, right)
+        iw, ih = w - 2, h - 2
+        sidew = 22 if iw < 64 else (26 if iw < 100 else 32)
+        side = sidew if iw >= axis + 18 + sidew else 0
+        gx = x + 1 + axis
+        gw = iw - axis - (side + 1 if side else 0)
+        gh = max(2, ih - 1 - reserve)
+        return NS(iy=y + 1, ix=x + 1, iw=iw, ih=ih, gx=gx, gw=gw, gh=gh, sx=gx + gw + 1, side=side)
+
+    def axis(s, L, labs, n):
+        rows = [L.iy, L.iy + L.gh // 2, L.iy + L.gh - 1]
+        for r, l in zip(rows, labs):
+            s.put(r, L.ix, f"{l[:5]:>5}", s.c("dim"))
+            s.put(r, L.ix + 5, "┤", s.c("line"))
+        secs = n * s.interval
+        yl = L.iy + L.gh
+        s.put(yl, L.gx, "-" + fw(secs), s.c("dim"))
+        mid = "-" + fw(secs / 2)
+        s.put(yl, L.gx + L.gw // 2 - len(mid) // 2, mid, s.c("dim"))
+        s.put(yl, L.gx + L.gw - 3, "now", s.c("dim"))
+
+    def grid(s, L, row=None):
+        r = L.iy + (L.gh // 2 if row is None else row)
+        s.put(r, L.gx, "┈" * L.gw, s.c("line"))
+
+    def markers(s, L, n, labels=False):
+        S = s.S
+        for i, m in enumerate(S.marks):
+            age = S.tick - 1 - m
+            if 0 <= age < n:
+                col = (n - 1 - age) * L.gw // n
+                if not labels:
+                    for r in range(L.gh):
+                        s.put(L.iy + r, L.gx + col, "┊", s.c("yel"))
+                else:
+                    lab = f"▾mark {i + 1}"
+                    xx = L.gx + col + 1 if col + 1 + len(lab) <= L.gw else L.gx + col - len(lab)
+                    s.put(L.iy, xx, lab, s.c("yel"))
+
+    def area(s, y, x, h, w, data, maxv, col):
+        a = s.c(col)
+        for c, v in enumerate(data):
+            if v is None or not maxv:
+                continue
+            e = int(round(min(v, maxv) / maxv * h * 8))
+            if v > 0 and e == 0:
+                e = 1
+            full, rem = divmod(e, 8)
+            for r in range(min(full, h)):
+                s.put(y + h - 1 - r, x + c, "█", a)
+            if rem and full < h:
+                s.put(y + h - 1 - full, x + c, BLK[rem], a)
+
+    def dual(s, L, up, down, maxv, cu, cd):
+        ht = L.gh // 2
+        hd = L.gh - ht
+        s.area(L.iy, L.gx, ht, L.gw, up, maxv, cu)
+        a = s.c(cd)
+        for c, v in enumerate(down):
+            if v is None or not maxv:
+                continue
+            r = int(round(min(v, maxv) / maxv * hd))
+            if v > 0 and r == 0:
+                r = 1
+            for k in range(r):
+                s.put(L.iy + ht + k, L.gx + c, "█", a)
+
+    def stacked(s, L, layers, maxv):
+        for c in range(L.gw):
+            cum = prev = 0
+            for data, col in layers:
+                v = data[c]
+                if v is None:
+                    break
+                cum += v
+                top = int(round(min(cum, maxv) / maxv * L.gh))
+                for r in range(prev, top):
+                    s.put(L.iy + L.gh - 1 - r, L.gx + c, "█", s.c(col))
+                prev = max(prev, top)
+
+    def side_lines(s, L, lines):
+        if not L.side:
+            return
+        for i, items in enumerate(lines[:L.gh + 1]):
+            s.segs(L.iy + i, L.sx, items, L.side)
+
+    # ---- paneller
+    def p_cpu(s, y, x, h, w, detail=False):
+        S, n = s.S, s.nwin
+        L = s.frame(y, x, h, w, "CPU", "▬ total ▬ kernel  [2]")
+        s.axis(L, ["100%", "50%", "0%"], n)
+        s.grid(L)
+        s.markers(L, n)
+        s.area(L.iy, L.gx, L.gh, L.gw, cols(S.h["cpu"], L.gw, n), 100, "d")
+        s.area(L.iy, L.gx, L.gh, L.gw, cols(S.h["cpu_sys"], L.gw, n), 100, "a")
+        s.markers(L, n, True)
+        win = list(S.h["cpu"])[-n:] or [0]
+        tot, usr, sy, io = S.cpu
+        la = os.getloadavg()
+        lines = [
+            [("TOTAL ", "dim"), (f"{tot:5.1f}%", "d"), ("  peak ", "dim"), (f"{max(win):.1f}%", "b")],
+            [("user ", "dim"), (f"{usr:.1f}%", "a"), ("  kernel ", "dim"), (f"{sy:.1f}%", "a")],
+            [("iowait ", "dim"), (f"{io:.1f}%", "txt"), ("  avg ", "dim"), (f"{sum(win) / len(win):.1f}%", "c")],
+            [("load ", "dim"), (f"{la[0]:.2f} {la[1]:.2f} {la[2]:.2f}", "txt")],
+            [("procs ", "dim"), (str(S.nproc), "txt"), ("  thr ", "dim"), (str(S.nthr), "txt"),
+             ("  run ", "dim"), (str(S.nrun), "txt")],
+            [],
+        ]
+        for i in range(NCPU):
+            p = S.cores[i]
+            it = [(f"c{i:<2}", "dim")] + s.bar(p / 100, 8, "b" if p > 70 else "a") + [(f" {p:3.0f}%", "txt")]
+            if S.freq[i]:
+                it.append((f" {S.freq[i]:.2f}GHz", "dim"))
+            lines.append(it)
+        s.side_lines(L, lines)
+
+    def p_mem(s, y, x, h, w, detail=False):
+        S, n = s.S, s.nwin
+        m = S.mem
+        L = s.frame(y, x, h, w, "Memory", f"used / {hb(m['total'])}  [3]")
+        s.axis(L, [hb(m["total"]), hb(m["total"] / 2), "0"], n)
+        names = [("app", "App(anon)", "b"), ("cache", "Cache", "a"), ("buf", "Buffers", "yel"),
+                 ("shm", "Shmem", "c"), ("krn", "Kernel", "d")]
+        s.markers(L, n)
+        s.stacked(L, [(cols(S.h["m_" + k], L.gw, n), col) for k, _, col in names], m["total"])
+        s.markers(L, n, True)
+        hist = list(S.h["mem_used"])[-60:]
+        tr = (hist[-1] - hist[0]) / max(1, len(hist) - 1) / s.interval * 60 / 1048576 if len(hist) > 1 else 0.0
+        lines = [
+            [("USED ", "dim"), (hb(m["used"]), "a"), (" / " + hb(m["total"]), "dim"),
+             (f"  {100 * m['used'] / m['total']:.0f}%", "txt")],
+            [("AVAIL ", "dim"), (hb(m["avail"]), "txt"), ("  swap ", "dim"),
+             (f"{hb(m['su'])}/{hb(m['st'])}", "txt")],
+            [],
+        ]
+        for k, nm, col in names:
+            hh = list(S.h["m_" + k])[-n:]
+            d = hh[-1] - hh[0] if len(hh) > 1 else 0
+            lines.append([("■ ", col), (f"{nm:<9}", "txt"), (f"{hb(m['layers'][k]):>5} ", "txt"),
+                          (hbs(d), "b" if d > 0 else "dim")])
+        lines.append([("trend ", "dim"), (f"{tr:+.2f} MB/min", "b" if tr > 0 else "green")])
+        s.side_lines(L, lines)
+
+    def p_disk(s, y, x, h, w, detail=False):
+        S, n = s.S, s.nwin
+        L = s.frame(y, x, h, w, "Disk I/O", "▀ read ▄ write  [4]")
+        hr, hw_ = list(S.h["dr"])[-n:], list(S.h["dw"])[-n:]
+        mx = nice(max(hr + hw_ + [0]), 1 << 20)
+        s.axis(L, ["R" + hb(mx), "0", "W" + hb(mx)], n)
+        s.grid(L)
+        s.markers(L, n)
+        s.dual(L, cols(S.h["dr"], L.gw, n), cols(S.h["dw"], L.gw, n), mx, "a", "b")
+        s.markers(L, n, True)
+        d = S.disk
+        lines = [
+            [("READ  ", "dim"), (hb(d["r"]) + "/s", "a")],
+            [("WRITE ", "dim"), (hb(d["w"]) + "/s", "b")],
+            [("util ", "dim"), (f"{d['util']:.0f}%", "red" if d["util"] > 80 else "txt"),
+             ("  iops ", "dim"), (f"{d['iops']:.0f}", "txt")],
+            [],
+        ]
+        for dev in d["devs"][:4]:
+            lines.append([(f"{dev[0][:7]:<8}", "dim"), (f"r {hb(dev[1])}", "a"), (f" w {hb(dev[2])}", "b")])
+        lines.append([])
+        for mnt, used, tot in S.fs:
+            f = used / tot
+            lines.append([(f"{mnt[-8:]:<9}", "dim")] + s.bar(f, 8, "red" if f > 0.9 else "a") + [(f" {f * 100:3.0f}%", "txt")])
+        s.side_lines(L, lines)
+
+    def p_net(s, y, x, h, w, detail=False):
+        S, n = s.S, s.nwin
+        L = s.frame(y, x, h, w, "Network", "all ifaces (no lo)  [5]")
+        a, b = list(S.h["rx"])[-n:], list(S.h["tx"])[-n:]
+        mx = nice(max(a + b + [0]), 64 << 10)
+        s.axis(L, ["↓" + hb(mx), "0", "↑" + hb(mx)], n)
+        s.grid(L)
+        s.markers(L, n)
+        s.dual(L, cols(S.h["rx"], L.gw, n), cols(S.h["tx"], L.gw, n), mx, "a", "c")
+        s.markers(L, n, True)
+        N = S.net
+        lines = [
+            [("↓ ", "a"), (hb(N["rx"]) + "/s", "a"), ("  " + hb(N["rxt"]), "dim")],
+            [("↑ ", "c"), (hb(N["tx"]) + "/s", "c"), ("  " + hb(N["txt"]), "dim")],
+            [("tcp est ", "dim"), (str(sum(S.est.values())), "txt"), ("  listen ", "dim"), (str(len(S.listen)), "yel")],
+        ]
+        for nm, st, rx, tx in N["ifs"][:3]:
+            col = "green" if st == "up" or nm.startswith(("tun", "tap")) else "dim"
+            lines.append([(f"{nm[:7]:<8}", col), (f"↓{hb(rx)} ↑{hb(tx)}", "dim")])
+        lines.append([])
+        lines.append([("TOP REMOTE", "dim")])
+        for ip, cnt in S.est.most_common(8 if detail else 5):
+            lines.append([(f"{ip[:20]:<21}", "txt"), (str(cnt), "b")])
+        if detail and S.listen:
+            lines.append([])
+            lines.append([("LISTEN ", "dim"), (" ".join(str(p) for p in sorted(S.listen)[:12]), "yel")])
+        s.side_lines(L, lines)
+
+    def p_proc(s, y, x, h, w, detail=False):
+        S, n = s.S, s.nwin
+        s.box(y, x, h, w, "Processes",
+              f"{S.nproc} procs · {S.nthr} thr · by {S.sort} [2]")
+        ix, iw, iy = x + 2, w - 4, y + 1
+        wp, wn, ws, wc, wm, wk = 7, 18 if iw >= 80 else 14, 2, 6, 7, 5
+        wh = iw - (wp + wn + ws + wc + wm + wk) - 1
+        hx = ix + wp + wn + ws + wc + wm
+        d = s.c("dim")
+        s.put(iy, ix, f"{'PID':<{wp}}{'NAME':<{wn}}{'S':<{ws}}{'CPU%':>{wc - 1}} {'MEM':>{wm - 1}} ", d)
+        if wh >= 8:
+            s.put(iy, hx, f"LAST {fw(n * s.interval)}", d)
+        s.put(iy, ix + iw - wk, f"{'CORE':>{wk}}", d)
+        for r, p in enumerate(S.procs[:h - 3]):
+            yy = iy + 1 + r
+            cc = "red" if p["cpu"] > 50 else ("b" if p["cpu"] > 10 else "a")
+            s.put(yy, ix, f"{p['pid']:<{wp}}", s.c("txt"))
+            s.put(yy, ix + wp, f"{p['name'][:wn - 1]:<{wn}}", s.c("title") | curses.A_BOLD if r == 0 else s.c("txt"))
+            s.put(yy, ix + wp + wn, f"{p['state']:<{ws}}", d)
+            s.put(yy, ix + wp + wn + ws, f"{p['cpu']:>{wc - 1}.1f} ", s.c(cc))
+            s.put(yy, ix + wp + wn + ws + wc, f"{hb(p['rss']):>{wm - 1}}", s.c("txt"))
+            if wh >= 8:
+                hh = cols(S.proc_hist.get(p["pid"], []), wh, n)
+                for c, v in enumerate(hh):
+                    if v is None:
+                        continue
+                    if v <= 0.05:
+                        s.put(yy, hx + c, "·", d)
+                    else:
+                        lv = min(8, max(1, math.ceil(v / 12.5)))
+                        s.put(yy, hx + c, BLK[lv], s.c("a" if v < 10 else ("b" if v < 50 else "red")))
+            s.put(yy, ix + iw - wk, f"{'c' + str(p['core']):>{wk}}", s.c("dim"))
+
+    def p_pow(s, y, x, h, w, detail=False):
+        S, n = s.S, s.nwin
+        temps = S.temps
+        res = min(3 if not detail else 6, max(1, (len(temps) + 1) // 2))
+        L = s.frame(y, x, h, w, "Power & Thermal", "[6]", reserve=res)
+        use_w = bool(S.bat and S.bat.get("watts"))
+        if use_w:
+            mx = nice(max(list(S.h["watts"])[-n:] + [0]), 10)
+            key, labs = "watts", [f"{mx:g}W", f"{mx / 2:g}W", "0"]
+        else:
+            mx, key, labs = 100, "tmax", ["100°", "50°", "0°"]
+        s.axis(L, labs, n)
+        s.grid(L)
+        s.markers(L, n)
+        s.area(L.iy, L.gx, L.gh, L.gw, cols(S.h[key], L.gw, n), mx, "b")
+        s.markers(L, n, True)
+        tmax = max([t for _, t in temps], default=0)
+        st, sc = ("n/a", "dim") if not temps else (
+            ("COOL", "green") if tmax < 55 else ("WARM", "yel") if tmax < 70 else ("HOT", "b") if tmax < 85 else ("CRIT", "red"))
+        up = float(rd("/proc/uptime", "0 0").split()[0])
+        lines = []
+        B = S.bat
+        if B:
+            lines.append([("BAT ", "dim"), (f"{B['cap']}%", "green"), ("  " + B["status"], "txt")])
+            if B["volt"]:
+                lines.append([("volt ", "dim"), (f"{B['volt']:.2f} V", "txt")] +
+                             ([("  " + f"{B['watts']:.1f} W", "b")] if B["watts"] else []))
+        else:
+            lines.append([("BAT ", "dim"), ("yok (masaüstü / VM)", "dim")])
+        lines.append([("AC  ", "dim"), ("online" if S.ac else ("offline" if S.ac == 0 else "?"), "txt")])
+        lines.append([])
+        lines.append([("thermal ", "dim"), (st, sc), (f"  max {tmax:.0f}°", "txt")])
+        lines.append([("uptime ", "dim"), (f"{int(up // 86400)}d {int(up % 86400 // 3600)}h {int(up % 3600 // 60)}m", "txt")])
+        s.side_lines(L, lines)
+        by = L.iy + L.gh + 1
+        if not temps:
+            s.put(by, L.ix + 1, "sıcaklık sensörü bulunamadı (VM?)", s.c("dim"))
+            return
+        colw = L.iw // 2
+        for i, (lab, t) in enumerate(temps[:res * 2]):
+            r, cidx = divmod(i, 2)
+            col = "red" if t >= 80 else ("b" if t >= 60 else "a")
+            bw = max(4, colw - 9 - 7)
+            s.put(by + r, L.ix + cidx * colw, f"{lab[:8]:<9}", s.c("dim"))
+            s.segs(by + r, L.ix + cidx * colw + 9, [(f"{t:4.1f}°", col), (" ", "dim")] + s.bar(t / 100, bw, col), colw - 9)
+
+    # ---- üst/alt
+    def header(s, W):
+        S = s.S
+        s.put(0, 0, " " * W, s.c("hdr"))
+        s.put(0, 1, "◉ parrottop", s.c("title") | curses.A_BOLD)
+        x = 15
+        for i, nm in enumerate(["Overview", "CPU", "Memory", "Disk", "Network", "Power"]):
+            lab = f" {i + 1} {nm} "
+            s.put(0, x, lab, (s.c("tab") | curses.A_BOLD) if s.page == i + 1 else s.c("hdr"))
+            x += len(lab) + 1
+        info = f"{s.host}  {s.distro}  {s.kernel}"
+        s.put(0, W - len(info) - 1, info, s.c("hdr"))
+        el = int(time.time() - s.t0)
+        la = os.getloadavg()[0]
+        up = float(rd("/proc/uptime", "0 0").split()[0])
+        items = [("● ", "red" if s.paused else "green"), ("PAUSED " if s.paused else "REC ", "txt"),
+                 (f"{el // 60:02d}:{el % 60:02d}", "txt"), (f"  #{S.tick}", "dim"), (f" @{s.interval:g}s", "dim"),
+                 ("  │  window ", "dim"), (fw(WINDOWS[s.wi]), "txt"),
+                 ("  │  THEME ", "dim"), (s.theme, "title"),
+                 ("  │  LOAD ", "dim"), (f"{la:.2f}", "b" if la > NCPU else "a"),
+                 ("  │  UP ", "dim"), (f"{int(up // 3600)}h{int(up % 3600 // 60):02d}m", "txt"),
+                 ("  │  LISTEN ", "dim"), (str(len(S.listen)), "yel"),
+                 ("  │  EST ", "dim"), (str(sum(S.est.values())), "yel")]
+        s.segs(1, 1, items, W - 2)
+
+    def footer(s, H, W):
+        if time.time() < s.flash[1]:
+            s.put(H - 1, 1, s.flash[0], s.c("yel"))
+            return
+        keys = [("1-6", "pages"), ("space", "pause"), ("m", "mark"), ("w", "window"), ("s", "sort"),
+                ("t", "theme"), (",", "interval"), ("e", "export"), ("?", "help"), ("q", "quit")]
+        x = 1
+        for k, v in keys:
+            s.put(H - 1, x, k, s.c("yel") | curses.A_BOLD)
+            s.put(H - 1, x + len(k) + 1, v, s.c("dim"))
+            x += len(k) + len(v) + 3
+
+    def draw_help(s, H, W):
+        lines = ["parrottop - kısayollar", "",
+                 "1-6      sayfalar (Overview/CPU/Memory/Disk/Network/Power)",
+                 "space    duraklat / devam", "m        grafiklere zaman işareti ekle",
+                 "w        pencere süresi (30s/1m/2m/5m)", "s        süreç sıralaması (cpu/mem/thr)",
+                 "t        tema (adbtop / parrot)", ",        örnekleme aralığı (1s/2s/0.5s)",
+                 "e        geçmişi ~/parrottop-*.csv olarak dışa aktar", "?        bu yardım",
+                 "q        çıkış", "", "TOP REMOTE: kurulu TCP bağlantı sayısına göre uzak IP'ler",
+                 "LISTEN: dinleyen TCP port sayısı (güvenlik denetimi için)"]
+        w, h = 66, len(lines) + 2
+        y0, x0 = max(0, (H - h) // 2), max(0, (W - w) // 2)
+        for r in range(h):
+            s.put(y0 + r, x0, " " * w)
+        s.box(y0, x0, h, w, "Help", "")
+        for i, l in enumerate(lines):
+            s.put(y0 + 1 + i, x0 + 2, l, s.c("title") | curses.A_BOLD if i == 0 else s.c("txt"))
+
+    def draw(s):
+        scr = s.scr
+        scr.erase()
+        H, W = scr.getmaxyx()
+        if H < 26 or W < 100:
+            s.put(0, 0, f"Terminal çok küçük ({W}x{H}); en az 100x26 gerekli.", s.c("red"))
+            scr.refresh()
+            return
+        s.header(W)
+        y0, bh = 2, H - 3
+        if s.page == 1:
+            r1 = r2 = bh // 3
+            r3 = bh - r1 - r2
+            w1 = W // 2
+            w2 = W - w1
+            s.p_cpu(y0, 0, r1, w1)
+            s.p_mem(y0, w1, r1, w2)
+            s.p_disk(y0 + r1, 0, r2, w1)
+            s.p_net(y0 + r1, w1, r2, w2)
+            s.p_proc(y0 + r1 + r2, 0, r3, w1)
+            s.p_pow(y0 + r1 + r2, w1, r3, w2)
+        elif s.page == 2:
+            h1 = bh // 2
+            s.p_cpu(y0, 0, h1, W, True)
+            s.p_proc(y0 + h1, 0, bh - h1, W, True)
+        else:
+            {3: s.p_mem, 4: s.p_disk, 5: s.p_net, 6: s.p_pow}[s.page](y0, 0, bh, W, True)
+        s.footer(H, W)
+        if s.help:
+            s.draw_help(H, W)
+        scr.refresh()
+
+    def export(s):
+        S = s.S
+        path = os.path.expanduser(time.strftime("~/parrottop-%Y%m%d-%H%M%S.csv"))
+        keys = ["cpu", "cpu_user", "cpu_sys", "mem_used", "dr", "dw", "rx", "tx", "tmax"]
+        n = min(len(S.h[k]) for k in keys)
+        try:
+            with open(path, "w", newline="") as f:
+                wr = csv.writer(f)
+                wr.writerow(["sample"] + keys)
+                for i in range(n):
+                    wr.writerow([i] + [round(list(S.h[k])[-n:][i], 3) for k in keys])
+            s.flash = (f"exported → {path}", time.time() + 4)
+        except Exception as e:
+            s.flash = (f"export failed: {e}", time.time() + 4)
+
+    def run(s):
+        last = time.time()
+        dirty = True
+        while True:
+            now = time.time()
+            if not s.paused and now - last >= s.interval:
+                s.S.sample()
+                last = now
+                dirty = True
+            if dirty or now < s.flash[1]:
+                s.draw()
+                dirty = False
+            k = s.scr.getch()
+            if k == -1:
+                continue
+            dirty = True
+            ch = chr(k) if 0 <= k < 256 else ""
+            if ch == "q":
+                return
+            elif ch in "123456" and ch:
+                s.page = int(ch)
+            elif ch == " ":
+                s.paused = not s.paused
+            elif ch == "w":
+                s.wi = (s.wi + 1) % len(WINDOWS)
+            elif ch == "s":
+                i = (SORTS.index(s.S.sort) + 1) % len(SORTS)
+                s.S.sort = SORTS[i]
+            elif ch == "t":
+                s.theme = "parrot" if s.theme == "adbtop" else "adbtop"
+                s.init_colors()
+            elif ch == ",":
+                s.ii = (s.ii + 1) % len(INTERVALS)
+            elif ch == "m":
+                s.S.marks.append(s.S.tick - 1)
+                s.flash = (f"mark {len(s.S.marks)} eklendi", time.time() + 2)
+            elif ch == "e":
+                s.export()
+            elif ch == "?":
+                s.help = not s.help
+            elif k == 27:
+                s.help = False
+
+
+def main():
+    locale.setlocale(locale.LC_ALL, "")
+    try:
+        curses.wrapper(lambda scr: App(scr).run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
