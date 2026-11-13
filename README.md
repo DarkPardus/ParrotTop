@@ -1,3 +1,6 @@
+chmod +x parrottop
+./parrottop
+
 ParrotTop is a terminal-based system monitoring tool running on Parrot Security OS.
 It provides real-time system information through a clean and detailed interface, including CPU usage, memory, disk activity, network traffic, power consumption and running processes.
 A lightweight and practical way to monitor system performance directly from the terminal.
